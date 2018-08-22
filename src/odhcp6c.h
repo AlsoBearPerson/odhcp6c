@@ -304,8 +304,6 @@ struct odhcp6c_entry {
 	struct in6_addr target;
 	uint32_t valid;
 	uint32_t preferred;
-	uint32_t t1;
-	uint32_t t2;
 	uint32_t iaid;
 	uint8_t auxtarget[];
 };

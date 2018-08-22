@@ -761,16 +761,6 @@ static void odhcp6c_expire_list(enum odhcp6c_state state, uint32_t elapsed)
 			(uint8_t*)c < &start[len] &&
 			(uint8_t*)odhcp6c_next_entry(c) <= &start[len];
 			) {
-		if (c->t1 < elapsed)
-			c->t1 = 0;
-		else if (c->t1 != UINT32_MAX)
-			c->t1 -= elapsed;
-
-		if (c->t2 < elapsed)
-			c->t2 = 0;
-		else if (c->t2 != UINT32_MAX)
-			c->t2 -= elapsed;
-
 		if (c->preferred < elapsed)
 			c->preferred = 0;
 		else if (c->preferred != UINT32_MAX)

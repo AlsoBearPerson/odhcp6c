@@ -59,9 +59,9 @@ static bool dhcpv6_response_is_valid(const void *buf, ssize_t len,
 		const uint8_t transaction[3], enum dhcpv6_msg type,
 		const struct in6_addr *daddr);
 
-static unsigned int dhcpv6_parse_ia(void *opt, void *end);
+static unsigned int dhcpv6_parse_ia(void *opt, void *end, int64_t *n_t1,
+		int64_t *n_t2, int64_t *n_t3);
 
-static int dhcpv6_calc_refresh_timers(void);
 static void dhcpv6_handle_status_code(_unused const enum dhcpv6_msg orig,
 		const uint16_t code, const void *status_msg, const int len,
 		int *ret);
@@ -956,8 +956,9 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 	uint8_t *odata;
 	uint16_t otype, olen;
 	uint32_t refresh = 86400;
+	int64_t n_t1 = UINT32_MAX, n_t2 = UINT32_MAX, n_t3 = 0;
 	int ret = 1;
-	unsigned int updated_IAs = 0;
+	unsigned int parsed_addrs = 0;
 	bool handled_status_codes[_DHCPV6_Status_Max] = { false, };
 
 	odhcp6c_expire();
@@ -1054,7 +1055,8 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 				if (code != DHCPV6_Success)
 					continue;
 
-				updated_IAs += dhcpv6_parse_ia(ia_hdr, odata + olen);
+				parsed_addrs += dhcpv6_parse_ia(ia_hdr, odata + olen,
+						&n_t1, &n_t2, &n_t3);
 			} else if (otype == DHCPV6_OPT_UNICAST && olen == sizeof(server_addr)) {
 				if (!(client_options & DHCPV6_IGNORE_OPT_UNICAST))
 					server_addr = *(struct in6_addr *)odata;
@@ -1147,7 +1149,12 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 	case DHCPV6_MSG_REBIND:
 	case DHCPV6_MSG_RENEW:
 		// Update refresh timers if no fatal status code was received
-		if ((ret > 0) && (ret = dhcpv6_calc_refresh_timers())) {
+		if (ret > 0) {
+			if (parsed_addrs) {
+				t1 = n_t1;
+				t2 = n_t2;
+				t3 = n_t3;
+			}
 			if (orig == DHCPV6_MSG_REQUEST) {
 				// All server candidates can be cleared if not yet bound
 				if (!odhcp6c_is_bound())
@@ -1156,25 +1163,14 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 				odhcp6c_clear_state(STATE_SERVER_ADDR);
 				odhcp6c_add_state(STATE_SERVER_ADDR, &from->sin6_addr, 16);
 			} else if (orig == DHCPV6_MSG_RENEW) {
-				// Send further renews if T1 is not set and
-				// no updated IAs
+				// If we didn't get a good T1, keep trying.
 				if (!t1) {
-					if (!updated_IAs)
-						ret = -1;
-					else if ((t2 - t1) > 1)
-						// Grace period of 1 second
-						t1 = 1;
+					ret = -1;
 				}
-
 			} else if (orig == DHCPV6_MSG_REBIND) {
-				// Send further rebinds if T1 and T2 is not set and
-				// no updated IAs
+				// If T1 and T2 didn't get good values, keep trying.
 				if (!t1 && !t2) {
-					if (!updated_IAs)
-						ret = -1;
-					else if ((t3 - t2) > 1)
-						// Grace period of 1 second
-						t2 = 1;
+					ret = -1;
 				}
 
 				odhcp6c_clear_state(STATE_SERVER_ADDR);
@@ -1200,19 +1196,23 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 	return ret;
 }
 
-static unsigned int dhcpv6_parse_ia(void *opt, void *end)
+static unsigned int dhcpv6_parse_ia(void *opt, void *end, int64_t *n_t1, int64_t *n_t2, int64_t *n_t3)
 {
 	struct dhcpv6_ia_hdr *ia_hdr = (struct dhcpv6_ia_hdr *)opt;
-	unsigned int updated_IAs = 0;
-	uint32_t t1, t2;
+	unsigned int parsed_addrs = 0;
+	uint32_t recvd_t1, recvd_t2;
 	uint16_t otype, olen;
 	uint8_t *odata;
 
-	t1 = ntohl(ia_hdr->t1);
-	t2 = ntohl(ia_hdr->t2);
-
-	if (t1 > t2)
+	recvd_t1 = ntohl(ia_hdr->t1);
+	recvd_t2 = ntohl(ia_hdr->t2);
+	if (recvd_t1 > recvd_t2)
 		return 0;
+
+	if (recvd_t1 && recvd_t1 < *n_t1)
+		*n_t1 = recvd_t1;
+	if (recvd_t2 && recvd_t2 < *n_t2)
+		*n_t2 = recvd_t2;
 
 	// Update address IA
 	dhcpv6_for_each_option(&ia_hdr[1], end, otype, olen, odata) {
@@ -1231,11 +1231,6 @@ static unsigned int dhcpv6_parse_ia(void *opt, void *end)
 
 			if (entry.preferred > entry.valid)
 				continue;
-
-			entry.t1 = (t1 ? t1 : (entry.preferred != UINT32_MAX ? 0.5 * entry.preferred : UINT32_MAX));
-			entry.t2 = (t2 ? t2 : (entry.preferred != UINT32_MAX ? 0.8 * entry.preferred : UINT32_MAX));
-			if (entry.t1 > entry.t2)
-				entry.t1 = entry.t2;
 
 			entry.length = prefix->prefix;
 			entry.target = prefix->addr;
@@ -1279,8 +1274,28 @@ static unsigned int dhcpv6_parse_ia(void *opt, void *end)
 			}
 
 			if (ok) {
-				if (odhcp6c_update_entry(STATE_IA_PD, &entry, 0, 0))
-					updated_IAs++;
+				if (!recvd_t1 && entry.valid) {
+					uint32_t entry_t1 = entry.preferred ? 0.5 * entry.preferred : 1200;
+					if (entry_t1 < *n_t1)
+						*n_t1 = entry_t1;
+				}
+				if (!recvd_t2 && entry.valid) {
+					uint32_t entry_t2 = entry.preferred ? 0.8 * entry.preferred : 1800;
+					if (entry_t2 < *n_t2) {
+						if (entry_t2 > *n_t1)
+							*n_t2 = entry_t2;
+						else
+							*n_t2 = *n_t1;
+					}
+				}
+				if (entry.valid > *n_t3)
+					*n_t3 = entry.valid;
+
+				odhcp6c_update_entry(STATE_IA_PD, &entry, 0, 0)
+				// We use this to determine "should we trust n_t{1..3}",
+				// so don't update it for revoked addresses.
+				if (entry.valid)
+					parsed_addrs++;
 			}
 
 			entry.priority = 0;
@@ -1296,62 +1311,32 @@ static unsigned int dhcpv6_parse_ia(void *opt, void *end)
 			if (entry.preferred > entry.valid)
 				continue;
 
-			entry.t1 = (t1 ? t1 : (entry.preferred != UINT32_MAX ? 0.5 * entry.preferred : UINT32_MAX));
-			entry.t2 = (t2 ? t2 : (entry.preferred != UINT32_MAX ? 0.8 * entry.preferred : UINT32_MAX));
-			if (entry.t1 > entry.t2)
-				entry.t1 = entry.t2;
+			if (!recvd_t1 && entry.valid) {
+				uint32_t entry_t1 = entry.preferred ? 0.5 * entry.preferred : 1200;
+				if (entry_t1 < *n_t1)
+					*n_t1 = entry_t1;
+			}
+			if (!recvd_t2 && entry.valid) {
+				uint32_t entry_t2 = entry.preferred ? 0.8 * entry.preferred : 1800;
+				if (entry_t2 < *n_t2) {
+					if (entry_t2 > *n_t1)
+						*n_t2 = entry_t2;
+					else
+						*n_t2 = *n_t1;
+				}
+			}
+			if (entry.valid > *n_t3)
+				*n_t3 = entry.valid;
 
 			entry.length = 128;
 			entry.target = addr->addr;
 
-			if (odhcp6c_update_entry(STATE_IA_NA, &entry, 0, 0))
-				updated_IAs++;
+			odhcp6c_update_entry(STATE_IA_NA, &entry, 0, 0);
+			if (entry.valid)
+				parsed_addrs++;
 		}
 	}
-	return updated_IAs;
-}
-
-static int dhcpv6_calc_refresh_timers(void)
-{
-	struct odhcp6c_entry *e;
-	size_t ia_na_entries, ia_pd_entries, i;
-	int64_t l_t1 = UINT32_MAX, l_t2 = UINT32_MAX, l_t3 = 0;
-
-	e = odhcp6c_get_state(STATE_IA_NA, &ia_na_entries);
-	ia_na_entries /= sizeof(*e);
-
-	for (i = 0; i < ia_na_entries; i++) {
-		if (e[i].t1 < l_t1)
-			l_t1 = e[i].t1;
-
-		if (e[i].t2 < l_t2)
-			l_t2 = e[i].t2;
-
-		if (e[i].valid > l_t3)
-			l_t3 = e[i].valid;
-	}
-
-	e = odhcp6c_get_state(STATE_IA_PD, &ia_pd_entries);
-	ia_pd_entries /= sizeof(*e);
-
-	for (i = 0; i < ia_pd_entries; i++) {
-		if (e[i].t1 < l_t1)
-			l_t1 = e[i].t1;
-
-		if (e[i].t2 < l_t2)
-			l_t2 = e[i].t2;
-
-		if (e[i].valid > l_t3)
-			l_t3 = e[i].valid;
-	}
-
-	if (ia_pd_entries || ia_na_entries) {
-		t1 = l_t1;
-		t2 = l_t2;
-		t3 = l_t3;
-	}
-
-	return (int)(ia_pd_entries + ia_na_entries);
+	return parsed_addrs;
 }
 
 static void dhcpv6_log_status_code(const uint16_t code, const char *scope,
