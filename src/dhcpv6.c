@@ -100,6 +100,11 @@ static struct dhcpv6_retx dhcpv6_retx[_DHCPV6_MSG_MAX] = {
 // Sockets
 static int sock = -1;
 static int ifindex = -1;
+// T1 is the timeout for RECONFIGURE polling.
+// T2 is the timeout for RENEW requests.
+// T3 is the timeout after which REBIND doesn't make sense anymore.
+// NOTE: Contrary to other tN variables, these are absolute timestamps,
+// in milliseconds since epoch.
 static int64_t t1 = 0, t2 = 0, t3 = 0;
 
 // IA states
@@ -541,7 +546,7 @@ static int64_t dhcpv6_rand_delay(int64_t time)
 int dhcpv6_request(enum dhcpv6_msg type)
 {
 	uint8_t rc = 0;
-	uint64_t timeout = UINT32_MAX;
+	uint64_t timeout;
 	struct dhcpv6_retx *retx = &dhcpv6_retx[type];
 
 	if (retx->delay) {
@@ -551,20 +556,21 @@ int dhcpv6_request(enum dhcpv6_msg type)
 		while (nanosleep(&ts, &ts) < 0 && errno == EINTR);
 	}
 
-	if (type == DHCPV6_MSG_UNKNOWN)
-		timeout = t1;
-	else if (type == DHCPV6_MSG_RENEW)
-		timeout = (t2 > t1) ? t2 - t1 : ((t1 == UINT32_MAX) ? UINT32_MAX : 0);
-	else if (type == DHCPV6_MSG_REBIND)
-		timeout = (t3 > t2) ? t3 - t2 : ((t2 == UINT32_MAX) ? UINT32_MAX : 0);
+	uint64_t start = odhcp6c_get_milli_time(), round_start = start, elapsed;
 
-	if (timeout == 0)
+	if (type == DHCPV6_MSG_UNKNOWN)
+		timeout = start - t1;
+	else if (type == DHCPV6_MSG_RENEW)
+		timeout = start - t2;
+	else if (type == DHCPV6_MSG_REBIND)
+		timeout = start - t3;
+
+	if (timeout <= 0)
 		return -1;
 
-	syslog(LOG_NOTICE, "Starting %s transaction (timeout %"PRIu64"s, max rc %d)",
+	syslog(LOG_NOTICE, "Starting %s transaction (timeout %"PRIu64"ms, max rc %d)",
 			retx->name, timeout, retx->max_rc);
 
-	uint64_t start = odhcp6c_get_milli_time(), round_start = start, elapsed;
 
 	// Generate transaction ID
 	uint8_t trid[3] = {0, 0, 0};
@@ -595,8 +601,8 @@ int dhcpv6_request(enum dhcpv6_msg type)
 		elapsed = round_start - start;
 
 		// Don't wait too long if timeout differs from infinite
-		if ((timeout != UINT32_MAX) && (round_end - start > timeout * 1000))
-			round_end = timeout * 1000 + start;
+		if (round_end - start > timeout)
+			round_end = timeout + start;
 
 		// Built and send package
 		switch (type) {
@@ -682,7 +688,7 @@ int dhcpv6_request(enum dhcpv6_msg type)
 		// Allow
 		if (retx->handler_finish)
 			len = retx->handler_finish();
-	} while (len < 0 && ((timeout == UINT32_MAX) || (elapsed / 1000 < timeout)) &&
+	} while (len < 0 && (elapsed < timeout) &&
 			(!retx->max_rc || rc < retx->max_rc));
 	return len;
 }
@@ -807,17 +813,16 @@ static int dhcpv6_handle_reconfigure(enum dhcpv6_msg orig, const int rc,
 	uint16_t otype, olen;
 	uint8_t *odata;
 	int msg = -1;
+	uint64_t now = odhcp6c_get_milli_time();
 
 	dhcpv6_for_each_option(opt, end, otype, olen, odata) {
 		if (otype == DHCPV6_OPT_RECONF_MESSAGE && olen == 1) {
 			switch (odata[0]) {
 			case DHCPV6_MSG_REBIND:
-				if (t2 != UINT32_MAX)
-					t2 = 0;
+				t2 = now;
 			// Fall through
 			case DHCPV6_MSG_RENEW:
-				if (t1 != UINT32_MAX)
-					t1 = 0;
+				t1 = now;
 			// Fall through
 			case DHCPV6_MSG_INFO_REQ:
 				msg = odata[0];
@@ -962,32 +967,6 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 	bool handled_status_codes[_DHCPV6_Status_Max] = { false, };
 
 	odhcp6c_expire();
-
-	if (orig == DHCPV6_MSG_UNKNOWN) {
-		static time_t last_update = 0;
-		time_t now = odhcp6c_get_milli_time() / 1000;
-
-		uint32_t elapsed = (last_update > 0) ? now - last_update : 0;
-		last_update = now;
-
-		if (t1 != UINT32_MAX)
-			t1 -= elapsed;
-
-		if (t2 != UINT32_MAX)
-			t2 -= elapsed;
-
-		if (t3 != UINT32_MAX)
-			t3 -= elapsed;
-
-		if (t1 < 0)
-			t1 = 0;
-
-		if (t2 < 0)
-			t2 = 0;
-
-		if (t3 < 0)
-			t3 = 0;
-	}
 
 	if (orig == DHCPV6_MSG_REQUEST && !odhcp6c_is_bound()) {
 		// Delete NA and PD we have in the state from the Advert
@@ -1143,7 +1122,9 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 				odhcp6c_add_state(STATE_PASSTHRU, &odata[-4], olen + 4);
 		}
 	}
-
+	
+	int64_t now = odhcp6c_get_milli_time();
+	
 	switch (orig) {
 	case DHCPV6_MSG_REQUEST:
 	case DHCPV6_MSG_REBIND:
@@ -1151,9 +1132,11 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 		// Update refresh timers if no fatal status code was received
 		if (ret > 0) {
 			if (parsed_addrs) {
-				t1 = n_t1;
-				t2 = n_t2;
-				t3 = n_t3;
+				// We don't treat UINT32_MAX specially. Fortunately, a 4Gs timeout
+				// won't expire for a hundred years, so we should be fine.
+				t1 = now + 1000 * n_t1;
+				t2 = now + 1000 * n_t2;
+				t3 = now + 1000 * n_t3;
 			}
 			if (orig == DHCPV6_MSG_REQUEST) {
 				// All server candidates can be cleared if not yet bound
@@ -1162,17 +1145,7 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 
 				odhcp6c_clear_state(STATE_SERVER_ADDR);
 				odhcp6c_add_state(STATE_SERVER_ADDR, &from->sin6_addr, 16);
-			} else if (orig == DHCPV6_MSG_RENEW) {
-				// If we didn't get a good T1, keep trying.
-				if (!t1) {
-					ret = -1;
-				}
 			} else if (orig == DHCPV6_MSG_REBIND) {
-				// If T1 and T2 didn't get good values, keep trying.
-				if (!t1 && !t2) {
-					ret = -1;
-				}
-
 				odhcp6c_clear_state(STATE_SERVER_ADDR);
 				odhcp6c_add_state(STATE_SERVER_ADDR, &from->sin6_addr, 16);
 			}
@@ -1185,7 +1158,7 @@ static int dhcpv6_handle_reply(enum dhcpv6_msg orig, _unused const int rc,
 			if (!odhcp6c_is_bound())
 				dhcpv6_clear_all_server_cand();
 
-			t1 = refresh;
+			t1 = odhcp6c_get_milli_time() + 1000 * refresh;
 		}
 		break;
 
